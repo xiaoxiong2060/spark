@@ -21,12 +21,11 @@ import java.nio.ByteBuffer
 
 import com.google.common.primitives.{Doubles, Ints, Longs}
 
-import org.apache.spark.sql.AnalysisException
-import org.apache.spark.sql.catalyst.{InternalRow}
+import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.analysis.TypeCheckResult
 import org.apache.spark.sql.catalyst.analysis.TypeCheckResult.{TypeCheckFailure, TypeCheckSuccess}
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.catalyst.expressions.aggregate.ApproximatePercentile.{PercentileDigest}
+import org.apache.spark.sql.catalyst.expressions.aggregate.ApproximatePercentile.PercentileDigest
 import org.apache.spark.sql.catalyst.util.{ArrayData, GenericArrayData}
 import org.apache.spark.sql.catalyst.util.QuantileSummaries
 import org.apache.spark.sql.catalyst.util.QuantileSummaries.{defaultCompressThreshold, Stats}
@@ -59,11 +58,11 @@ import org.apache.spark.sql.types._
       In this case, returns the approximate percentile array of column `col` at the given
       percentage array.
   """,
-  extended = """
+  examples = """
     Examples:
-      > SELECT percentile_approx(10.0, array(0.5, 0.4, 0.1), 100);
+      > SELECT _FUNC_(10.0, array(0.5, 0.4, 0.1), 100);
        [10.0,10.0,10.0]
-      > SELECT percentile_approx(10.0, 0.5, 100);
+      > SELECT _FUNC_(10.0, 0.5, 100);
        10.0
   """)
 case class ApproximatePercentile(
@@ -71,7 +70,8 @@ case class ApproximatePercentile(
     percentageExpression: Expression,
     accuracyExpression: Expression,
     override val mutableAggBufferOffset: Int,
-    override val inputAggBufferOffset: Int) extends TypedImperativeAggregate[PercentileDigest] {
+    override val inputAggBufferOffset: Int)
+  extends TypedImperativeAggregate[PercentileDigest] with ImplicitCastInputTypes {
 
   def this(child: Expression, percentageExpression: Expression, accuracyExpression: Expression) = {
     this(child, percentageExpression, accuracyExpression, 0, 0)
@@ -85,23 +85,19 @@ case class ApproximatePercentile(
   private lazy val accuracy: Int = accuracyExpression.eval().asInstanceOf[Int]
 
   override def inputTypes: Seq[AbstractDataType] = {
-    Seq(DoubleType, TypeCollection(DoubleType, ArrayType), IntegerType)
+    // Support NumericType, DateType and TimestampType since their internal types are all numeric,
+    // and can be easily cast to double for processing.
+    Seq(TypeCollection(NumericType, DateType, TimestampType),
+      TypeCollection(DoubleType, ArrayType(DoubleType)), IntegerType)
   }
 
   // Mark as lazy so that percentageExpression is not evaluated during tree transformation.
-  private lazy val (returnPercentileArray: Boolean, percentages: Array[Double]) = {
-    (percentageExpression.dataType, percentageExpression.eval()) match {
+  private lazy val (returnPercentileArray: Boolean, percentages: Array[Double]) =
+    percentageExpression.eval() match {
       // Rule ImplicitTypeCasts can cast other numeric types to double
-      case (_, num: Double) => (false, Array(num))
-      case (ArrayType(baseType: NumericType, _), arrayData: ArrayData) =>
-         val numericArray = arrayData.toObjectArray(baseType)
-        (true, numericArray.map { x =>
-          baseType.numeric.toDouble(x.asInstanceOf[baseType.InternalType])
-        })
-      case other =>
-        throw new AnalysisException(s"Invalid data type ${other._1} for parameter percentage")
+      case num: Double => (false, Array(num))
+      case arrayData: ArrayData => (true, arrayData.toDoubleArray())
     }
-  }
 
   override def checkInputDataTypes(): TypeCheckResult = {
     val defaultCheck = super.checkInputDataTypes()
@@ -126,20 +122,43 @@ case class ApproximatePercentile(
     new PercentileDigest(relativeError)
   }
 
-  override def update(buffer: PercentileDigest, inputRow: InternalRow): Unit = {
+  override def update(buffer: PercentileDigest, inputRow: InternalRow): PercentileDigest = {
     val value = child.eval(inputRow)
     // Ignore empty rows, for example: percentile_approx(null)
     if (value != null) {
-      buffer.add(value.asInstanceOf[Double])
+      // Convert the value to a double value
+      val doubleValue = child.dataType match {
+        case DateType => value.asInstanceOf[Int].toDouble
+        case TimestampType => value.asInstanceOf[Long].toDouble
+        case n: NumericType => n.numeric.toDouble(value.asInstanceOf[n.InternalType])
+        case other: DataType =>
+          throw new UnsupportedOperationException(s"Unexpected data type ${other.simpleString}")
+      }
+      buffer.add(doubleValue)
     }
+    buffer
   }
 
-  override def merge(buffer: PercentileDigest, other: PercentileDigest): Unit = {
+  override def merge(buffer: PercentileDigest, other: PercentileDigest): PercentileDigest = {
     buffer.merge(other)
+    buffer
   }
 
   override def eval(buffer: PercentileDigest): Any = {
-    val result = buffer.getPercentiles(percentages)
+    val doubleResult = buffer.getPercentiles(percentages)
+    val result = child.dataType match {
+      case DateType => doubleResult.map(_.toInt)
+      case TimestampType => doubleResult.map(_.toLong)
+      case ByteType => doubleResult.map(_.toByte)
+      case ShortType => doubleResult.map(_.toShort)
+      case IntegerType => doubleResult.map(_.toInt)
+      case LongType => doubleResult.map(_.toLong)
+      case FloatType => doubleResult.map(_.toFloat)
+      case DoubleType => doubleResult
+      case _: DecimalType => doubleResult.map(Decimal(_))
+      case other: DataType =>
+        throw new UnsupportedOperationException(s"Unexpected data type ${other.simpleString}")
+    }
     if (result.length == 0) {
       null
     } else if (returnPercentileArray) {
@@ -160,8 +179,9 @@ case class ApproximatePercentile(
   // Returns null for empty inputs
   override def nullable: Boolean = true
 
+  // The result type is the same as the input type.
   override def dataType: DataType = {
-    if (returnPercentileArray) ArrayType(DoubleType) else DoubleType
+    if (returnPercentileArray) ArrayType(child.dataType, false) else child.dataType
   }
 
   override def prettyName: String = "percentile_approx"
@@ -250,7 +270,8 @@ object ApproximatePercentile {
         val result = new Array[Double](percentages.length)
         var i = 0
         while (i < percentages.length) {
-          result(i) = summaries.query(percentages(i))
+          // Since summaries.count != 0, the query here never return None.
+          result(i) = summaries.query(percentages(i)).get
           i += 1
         }
         result
@@ -275,8 +296,8 @@ object ApproximatePercentile {
       Ints.BYTES + Doubles.BYTES + Longs.BYTES +
       // length of summary.sampled
       Ints.BYTES +
-      // summary.sampled, Array[Stat(value: Double, g: Int, delta: Int)]
-      summaries.sampled.length * (Doubles.BYTES + Ints.BYTES + Ints.BYTES)
+      // summary.sampled, Array[Stat(value: Double, g: Long, delta: Long)]
+      summaries.sampled.length * (Doubles.BYTES + Longs.BYTES + Longs.BYTES)
     }
 
     final def serialize(obj: PercentileDigest): Array[Byte] = {
@@ -291,8 +312,8 @@ object ApproximatePercentile {
       while (i < summary.sampled.length) {
         val stat = summary.sampled(i)
         buffer.putDouble(stat.value)
-        buffer.putInt(stat.g)
-        buffer.putInt(stat.delta)
+        buffer.putLong(stat.g)
+        buffer.putLong(stat.delta)
         i += 1
       }
       buffer.array()
@@ -309,8 +330,8 @@ object ApproximatePercentile {
       var i = 0
       while (i < sampledLength) {
         val value = buffer.getDouble()
-        val g = buffer.getInt()
-        val delta = buffer.getInt()
+        val g = buffer.getLong()
+        val delta = buffer.getLong()
         sampled(i) = Stats(value, g, delta)
         i += 1
       }

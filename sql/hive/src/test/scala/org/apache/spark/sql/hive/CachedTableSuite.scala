@@ -101,13 +101,20 @@ class CachedTableSuite extends QueryTest with SQLTestUtils with TestHiveSingleto
     sql("DROP TABLE IF EXISTS nonexistantTable")
   }
 
-  test("correct error on uncache of nonexistant tables") {
-    intercept[NoSuchTableException] {
+  test("uncache of nonexistant tables") {
+    val expectedErrorMsg = "Table or view not found: nonexistantTable"
+    // make sure table doesn't exist
+    var e = intercept[AnalysisException](spark.table("nonexistantTable")).getMessage
+    assert(e.contains(expectedErrorMsg))
+    e = intercept[AnalysisException] {
       spark.catalog.uncacheTable("nonexistantTable")
-    }
-    intercept[NoSuchTableException] {
+    }.getMessage
+    assert(e.contains(expectedErrorMsg))
+    e = intercept[AnalysisException] {
       sql("UNCACHE TABLE nonexistantTable")
-    }
+    }.getMessage
+    assert(e.contains(expectedErrorMsg))
+    sql("UNCACHE TABLE IF EXISTS nonexistantTable")
   }
 
   test("no error on uncache of non-cached table") {
@@ -192,22 +199,15 @@ class CachedTableSuite extends QueryTest with SQLTestUtils with TestHiveSingleto
     tempPath.delete()
     table("src").write.mode(SaveMode.Overwrite).parquet(tempPath.toString)
     sql("DROP TABLE IF EXISTS refreshTable")
-    sparkSession.catalog.createExternalTable("refreshTable", tempPath.toString, "parquet")
-    checkAnswer(
-      table("refreshTable"),
-      table("src").collect())
+    sparkSession.catalog.createTable("refreshTable", tempPath.toString, "parquet")
+    checkAnswer(table("refreshTable"), table("src"))
     // Cache the table.
     sql("CACHE TABLE refreshTable")
     assertCached(table("refreshTable"))
     // Append new data.
     table("src").write.mode(SaveMode.Append).parquet(tempPath.toString)
-    // We are still using the old data.
     assertCached(table("refreshTable"))
-    checkAnswer(
-      table("refreshTable"),
-      table("src").collect())
-    // Refresh the table.
-    sql("REFRESH TABLE refreshTable")
+
     // We are using the new data.
     assertCached(table("refreshTable"))
     checkAnswer(
@@ -246,13 +246,8 @@ class CachedTableSuite extends QueryTest with SQLTestUtils with TestHiveSingleto
     assertCached(table("refreshTable"))
     // Append new data.
     table("src").write.mode(SaveMode.Append).parquet(tempPath.toString)
-    // We are still using the old data.
     assertCached(table("refreshTable"))
-    checkAnswer(
-      table("refreshTable"),
-      table("src").collect())
-    // Refresh the table.
-    sql(s"REFRESH ${tempPath.toString}")
+
     // We are using the new data.
     assertCached(table("refreshTable"))
     checkAnswer(
@@ -338,7 +333,7 @@ class CachedTableSuite extends QueryTest with SQLTestUtils with TestHiveSingleto
         fileFormat = new ParquetFileFormat(),
         options = Map.empty)(sparkSession = spark)
 
-      val plan = LogicalRelation(relation, catalogTable = Some(tableMeta))
+      val plan = LogicalRelation(relation, tableMeta)
       spark.sharedState.cacheManager.cacheQuery(Dataset.ofRows(spark, plan))
 
       assert(spark.sharedState.cacheManager.lookupCachedData(plan).isDefined)
@@ -351,7 +346,7 @@ class CachedTableSuite extends QueryTest with SQLTestUtils with TestHiveSingleto
         bucketSpec = None,
         fileFormat = new ParquetFileFormat(),
         options = Map.empty)(sparkSession = spark)
-      val samePlan = LogicalRelation(sameRelation, catalogTable = Some(tableMeta))
+      val samePlan = LogicalRelation(sameRelation, tableMeta)
 
       assert(spark.sharedState.cacheManager.lookupCachedData(samePlan).isDefined)
     }

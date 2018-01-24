@@ -38,7 +38,7 @@ sys.path.append(os.path.join(os.path.dirname(os.path.realpath(__file__)), "../de
 
 
 from sparktestsupport import SPARK_HOME  # noqa (suppress pep8 warnings)
-from sparktestsupport.shellutils import which, subprocess_check_output  # noqa
+from sparktestsupport.shellutils import which, subprocess_check_output, run_cmd  # noqa
 from sparktestsupport.modules import all_modules  # noqa
 
 
@@ -54,7 +54,9 @@ FAILURE_REPORTING_LOCK = Lock()
 LOGGER = logging.getLogger()
 
 # Find out where the assembly jars are located.
-for scala in ["2.11", "2.10"]:
+# Later, add back 2.12 to this list:
+# for scala in ["2.11", "2.12"]:
+for scala in ["2.11"]:
     build_dir = os.path.join(SPARK_HOME, "assembly", "target", "scala-" + scala)
     if os.path.isdir(build_dir):
         SPARK_DIST_CLASSPATH = os.path.join(build_dir, "jars", "*")
@@ -72,7 +74,7 @@ def run_individual_python_test(test_name, pyspark_python):
         'PYSPARK_PYTHON': which(pyspark_python),
         'PYSPARK_DRIVER_PYTHON': which(pyspark_python)
     })
-    LOGGER.debug("Starting test(%s): %s", pyspark_python, test_name)
+    LOGGER.info("Starting test(%s): %s", pyspark_python, test_name)
     start_time = time.time()
     try:
         per_test_output = tempfile.TemporaryFile()
@@ -111,9 +113,9 @@ def run_individual_python_test(test_name, pyspark_python):
 
 
 def get_default_python_executables():
-    python_execs = [x for x in ["python2.6", "python3.4", "pypy"] if which(x)]
-    if "python2.6" not in python_execs:
-        LOGGER.warning("Not testing against `python2.6` because it could not be found; falling"
+    python_execs = [x for x in ["python2.7", "python3.4", "pypy"] if which(x)]
+    if "python2.7" not in python_execs:
+        LOGGER.warning("Not testing against `python2.7` because it could not be found; falling"
                        " back to `python` instead")
         python_execs.insert(0, "python")
     return python_execs
@@ -173,6 +175,9 @@ def main():
 
     task_queue = Queue.PriorityQueue()
     for python_exec in python_execs:
+        if "COVERAGE_PROCESS_START" in os.environ:
+            # Make sure if coverage is installed.
+            run_cmd([python_exec, "-c", "import coverage"])
         python_implementation = subprocess_check_output(
             [python_exec, "-c", "import platform; print(platform.python_implementation())"],
             universal_newlines=True).strip()

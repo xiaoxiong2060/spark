@@ -45,7 +45,7 @@ import org.apache.spark.util.Utils
  */
 @ExpressionDescription(
   usage = "_FUNC_(class, method[, arg1[, arg2 ..]]) - Calls a method with reflection.",
-  extended = """
+  examples = """
     Examples:
       > SELECT _FUNC_('java.util.UUID', 'randomUUID');
        c33fb387-8500-4bfa-81d2-6e0e3e930df2
@@ -65,6 +65,10 @@ case class CallMethodViaReflection(children: Seq[Expression])
       TypeCheckFailure("first two arguments should be string literals")
     } else if (!classExists) {
       TypeCheckFailure(s"class $className not found")
+    } else if (children.slice(2, children.length)
+        .exists(e => !CallMethodViaReflection.typeMapping.contains(e.dataType))) {
+      TypeCheckFailure("arguments from the third require boolean, byte, short, " +
+        "integer, long, float, double or string expressions")
     } else if (method == null) {
       TypeCheckFailure(s"cannot find a static method that matches the argument types in $className")
     } else {
@@ -72,7 +76,7 @@ case class CallMethodViaReflection(children: Seq[Expression])
     }
   }
 
-  override def deterministic: Boolean = false
+  override lazy val deterministic: Boolean = false
   override def nullable: Boolean = true
   override val dataType: DataType = StringType
 

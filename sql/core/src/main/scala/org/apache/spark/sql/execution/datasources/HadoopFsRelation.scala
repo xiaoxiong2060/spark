@@ -17,11 +17,15 @@
 
 package org.apache.spark.sql.execution.datasources
 
+import java.util.Locale
+
+import scala.collection.mutable
+
 import org.apache.spark.sql.{SparkSession, SQLContext}
 import org.apache.spark.sql.catalyst.catalog.BucketSpec
 import org.apache.spark.sql.execution.FileRelation
 import org.apache.spark.sql.sources.{BaseRelation, DataSourceRegister}
-import org.apache.spark.sql.types.StructType
+import org.apache.spark.sql.types.{StructField, StructType}
 
 
 /**
@@ -48,11 +52,24 @@ case class HadoopFsRelation(
 
   override def sqlContext: SQLContext = sparkSession.sqlContext
 
+  private def getColName(f: StructField): String = {
+    if (sparkSession.sessionState.conf.caseSensitiveAnalysis) {
+      f.name
+    } else {
+      f.name.toLowerCase(Locale.ROOT)
+    }
+  }
+
+  val overlappedPartCols = mutable.Map.empty[String, StructField]
+  partitionSchema.foreach { partitionField =>
+    if (dataSchema.exists(getColName(_) == getColName(partitionField))) {
+      overlappedPartCols += getColName(partitionField) -> partitionField
+    }
+  }
+
   val schema: StructType = {
-    val dataSchemaColumnNames = dataSchema.map(_.name.toLowerCase).toSet
-    StructType(dataSchema ++ partitionSchema.filterNot { column =>
-      dataSchemaColumnNames.contains(column.name.toLowerCase)
-    })
+    StructType(dataSchema.map(f => overlappedPartCols.getOrElse(getColName(f), f)) ++
+      partitionSchema.filterNot(f => overlappedPartCols.contains(getColName(f))))
   }
 
   def partitionSchemaOption: Option[StructType] =
@@ -65,7 +82,11 @@ case class HadoopFsRelation(
     }
   }
 
-  override def sizeInBytes: Long = location.sizeInBytes
+  override def sizeInBytes: Long = {
+    val compressionFactor = sqlContext.conf.fileCompressionFactor
+    (location.sizeInBytes * compressionFactor).toLong
+  }
+
 
   override def inputFiles: Array[String] = location.inputFiles
 }

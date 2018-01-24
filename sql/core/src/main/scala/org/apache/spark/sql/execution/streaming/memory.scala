@@ -20,6 +20,8 @@ package org.apache.spark.sql.execution.streaming
 import java.util.concurrent.atomic.AtomicInteger
 import javax.annotation.concurrent.GuardedBy
 
+import scala.collection.JavaConverters._
+import scala.collection.mutable
 import scala.collection.mutable.{ArrayBuffer, ListBuffer}
 import scala.util.control.NonFatal
 
@@ -27,10 +29,13 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.sql._
 import org.apache.spark.sql.catalyst.encoders.encoderFor
 import org.apache.spark.sql.catalyst.expressions.Attribute
-import org.apache.spark.sql.catalyst.plans.logical.{LeafNode, Statistics}
+import org.apache.spark.sql.catalyst.plans.logical.{LeafNode, LocalRelation, Statistics}
+import org.apache.spark.sql.catalyst.streaming.InternalOutputModes._
+import org.apache.spark.sql.execution.SQLExecution
 import org.apache.spark.sql.streaming.OutputMode
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.util.Utils
+
 
 object MemoryStream {
   protected val currentBlockId = new AtomicInteger(0)
@@ -42,13 +47,13 @@ object MemoryStream {
 
 /**
  * A [[Source]] that produces value stored in memory as they are added by the user.  This [[Source]]
- * is primarily intended for use in unit tests as it can only replay data when the object is still
+ * is intended for use in unit tests as it can only replay data when the object is still
  * available.
  */
 case class MemoryStream[A : Encoder](id: Int, sqlContext: SQLContext)
     extends Source with Logging {
   protected val encoder = encoderFor[A]
-  protected val logicalPlan = StreamingExecutionRelation(this)
+  protected val logicalPlan = StreamingExecutionRelation(this, sqlContext.sparkSession)
   protected val output = logicalPlan.output
 
   /**
@@ -70,11 +75,11 @@ case class MemoryStream[A : Encoder](id: Int, sqlContext: SQLContext)
 
   def schema: StructType = encoder.schema
 
-  def toDS()(implicit sqlContext: SQLContext): Dataset[A] = {
+  def toDS(): Dataset[A] = {
     Dataset(sqlContext.sparkSession, logicalPlan)
   }
 
-  def toDF()(implicit sqlContext: SQLContext): DataFrame = {
+  def toDF(): DataFrame = {
     Dataset.ofRows(sqlContext.sparkSession, logicalPlan)
   }
 
@@ -83,8 +88,9 @@ case class MemoryStream[A : Encoder](id: Int, sqlContext: SQLContext)
   }
 
   def addData(data: TraversableOnce[A]): Offset = {
-    import sqlContext.implicits._
-    val ds = data.toVector.toDS()
+    val encoded = data.toVector.map(d => encoder.toRow(d).copy())
+    val plan = new LocalRelation(schema.toAttributes, encoded, isStreaming = true)
+    val ds = Dataset[A](sqlContext.sparkSession, plan)
     logDebug(s"Adding ds: $ds")
     this.synchronized {
       currentOffset = currentOffset + 1
@@ -113,17 +119,38 @@ case class MemoryStream[A : Encoder](id: Int, sqlContext: SQLContext)
     val newBlocks = synchronized {
       val sliceStart = startOrdinal - lastOffsetCommitted.offset.toInt - 1
       val sliceEnd = endOrdinal - lastOffsetCommitted.offset.toInt - 1
+      assert(sliceStart <= sliceEnd, s"sliceStart: $sliceStart sliceEnd: $sliceEnd")
       batches.slice(sliceStart, sliceEnd)
     }
 
-    logDebug(
-      s"MemoryBatch [$startOrdinal, $endOrdinal]: ${newBlocks.flatMap(_.collect()).mkString(", ")}")
+    if (newBlocks.isEmpty) {
+      return sqlContext.internalCreateDataFrame(
+        sqlContext.sparkContext.emptyRDD, schema, isStreaming = true)
+    }
+
+    logDebug(generateDebugString(newBlocks, startOrdinal, endOrdinal))
+
     newBlocks
       .map(_.toDF())
       .reduceOption(_ union _)
       .getOrElse {
         sys.error("No data selected!")
       }
+  }
+
+  private def generateDebugString(
+      blocks: TraversableOnce[Dataset[A]],
+      startOrdinal: Int,
+      endOrdinal: Int): String = {
+    val originalUnsupportedCheck =
+      sqlContext.getConf("spark.sql.streaming.unsupportedOperationCheck")
+    try {
+      sqlContext.setConf("spark.sql.streaming.unsupportedOperationCheck", "false")
+      s"MemoryBatch [$startOrdinal, $endOrdinal]: " +
+          s"${blocks.flatMap(_.collect()).mkString(", ")}"
+    } finally {
+      sqlContext.setConf("spark.sql.streaming.unsupportedOperationCheck", originalUnsupportedCheck)
+    }
   }
 
   override def commit(end: Offset): Unit = synchronized {
@@ -186,16 +213,23 @@ class MemorySink(val schema: StructType, outputMode: OutputMode) extends Sink wi
     }.mkString("\n")
   }
 
-  override def addBatch(batchId: Long, data: DataFrame): Unit = synchronized {
-    if (latestBatchId.isEmpty || batchId > latestBatchId.get) {
+  override def addBatch(batchId: Long, data: DataFrame): Unit = {
+    val notCommitted = synchronized {
+      latestBatchId.isEmpty || batchId > latestBatchId.get
+    }
+    if (notCommitted) {
       logDebug(s"Committing batch $batchId to $this")
       outputMode match {
-        case InternalOutputModes.Append | InternalOutputModes.Update =>
-          batches.append(AddedData(batchId, data.collect()))
+        case Append | Update =>
+          val rows = AddedData(batchId, data.collect())
+          synchronized { batches += rows }
 
-        case InternalOutputModes.Complete =>
-          batches.clear()
-          batches += AddedData(batchId, data.collect())
+        case Complete =>
+          val rows = AddedData(batchId, data.collect())
+          synchronized {
+            batches.clear()
+            batches += rows
+          }
 
         case _ =>
           throw new IllegalArgumentException(
@@ -204,6 +238,10 @@ class MemorySink(val schema: StructType, outputMode: OutputMode) extends Sink wi
     } else {
       logDebug(s"Skipping already committed batch: $batchId")
     }
+  }
+
+  def clear(): Unit = synchronized {
+    batches.clear()
   }
 
   override def toString(): String = "MemorySink"
@@ -217,5 +255,5 @@ case class MemoryPlan(sink: MemorySink, output: Seq[Attribute]) extends LeafNode
 
   private val sizePerRow = sink.schema.toAttributes.map(_.dataType.defaultSize).sum
 
-  override def statistics: Statistics = Statistics(sizePerRow * sink.allData.size)
+  override def computeStats(): Statistics = Statistics(sizePerRow * sink.allData.size)
 }

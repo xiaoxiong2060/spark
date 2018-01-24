@@ -51,7 +51,7 @@ sparkR.session()
 
 #### Making changes to SparkR
 
-The [instructions](https://cwiki.apache.org/confluence/display/SPARK/Contributing+to+Spark) for making contributions to Spark also apply to SparkR.
+The [instructions](http://spark.apache.org/contributing.html) for making contributions to Spark also apply to SparkR.
 If you only make R file changes (i.e. no Scala changes) then you can just re-install the R package using `R/install-dev.sh` and test your changes.
 Once you have made your changes, please include unit tests for them and run existing unit tests using the `R/run-tests.sh` script as described below.
 
@@ -66,11 +66,7 @@ To run one of them, use `./bin/spark-submit <filename> <args>`. For example:
 ```bash
 ./bin/spark-submit examples/src/main/r/dataframe.R
 ```
-You can also run the unit tests for SparkR by running. You need to install the [testthat](http://cran.r-project.org/web/packages/testthat/index.html) package first:
-```bash
-R -e 'install.packages("testthat", repos="http://cran.us.r-project.org")'
-./R/run-tests.sh
-```
+You can run R unit tests by following the instructions under [Running R Tests](http://spark.apache.org/docs/latest/building-spark.html#running-r-tests).
 
 ### Running on YARN
 

@@ -1,19 +1,19 @@
 /*
-* Licensed to the Apache Software Foundation (ASF) under one or more
-* contributor license agreements.  See the NOTICE file distributed with
-* this work for additional information regarding copyright ownership.
-* The ASF licenses this file to You under the Apache License, Version 2.0
-* (the "License"); you may not use this file except in compliance with
-* the License.  You may obtain a copy of the License at
-*
-*    http://www.apache.org/licenses/LICENSE-2.0
-*
-* Unless required by applicable law or agreed to in writing, software
-* distributed under the License is distributed on an "AS IS" BASIS,
-* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-* See the License for the specific language governing permissions and
-* limitations under the License.
-*/
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package org.apache.spark.sql.execution.streaming
 
@@ -28,17 +28,18 @@ import org.apache.spark.sql.SparkSession
 /**
  * This class is used to log offsets to persistent files in HDFS.
  * Each file corresponds to a specific batch of offsets. The file
- * format contain a version string in the first line, followed
+ * format contains a version string in the first line, followed
  * by a the JSON string representation of the offsets separated
  * by a newline character. If a source offset is missing, then
  * that line will contain a string value defined in the
  * SERIALIZED_VOID_OFFSET variable in [[OffsetSeqLog]] companion object.
- * For instance, when dealine wiht [[LongOffset]] types:
- *   v1   // version 1
- *   {0}  // LongOffset 0
- *   {3}  // LongOffset 3
- *   -    // No offset for this source i.e., an invalid JSON string
- *   {2}  // LongOffset 2
+ * For instance, when dealing with [[LongOffset]] types:
+ *   v1        // version 1
+ *   metadata
+ *   {0}       // LongOffset 0
+ *   {3}       // LongOffset 3
+ *   -         // No offset for this source i.e., an invalid JSON string
+ *   {2}       // LongOffset 2
  *   ...
  */
 class OffsetSeqLog(sparkSession: SparkSession, path: String)
@@ -54,17 +55,27 @@ class OffsetSeqLog(sparkSession: SparkSession, path: String)
     if (!lines.hasNext) {
       throw new IllegalStateException("Incomplete log file")
     }
-    val version = lines.next()
-    if (version != OffsetSeqLog.VERSION) {
-      throw new IllegalStateException(s"Unknown log version: ${version}")
+
+    val version = parseVersion(lines.next(), OffsetSeqLog.VERSION)
+
+    // read metadata
+    val metadata = lines.next().trim match {
+      case "" => None
+      case md => Some(md)
     }
-    OffsetSeq.fill(lines.map(parseOffset).toArray: _*)
+    OffsetSeq.fill(metadata, lines.map(parseOffset).toArray: _*)
   }
 
-  override protected def serialize(metadata: OffsetSeq, out: OutputStream): Unit = {
+  override protected def serialize(offsetSeq: OffsetSeq, out: OutputStream): Unit = {
     // called inside a try-finally where the underlying stream is closed in the caller
-    out.write(OffsetSeqLog.VERSION.getBytes(UTF_8))
-    metadata.offsets.map(_.map(_.json)).foreach { offset =>
+    out.write(("v" + OffsetSeqLog.VERSION).getBytes(UTF_8))
+
+    // write metadata
+    out.write('\n')
+    out.write(offsetSeq.metadata.map(_.json).getOrElse("").getBytes(UTF_8))
+
+    // write offsets, one per line
+    offsetSeq.offsets.map(_.map(_.json)).foreach { offset =>
       out.write('\n')
       offset match {
         case Some(json: String) => out.write(json.getBytes(UTF_8))
@@ -75,6 +86,6 @@ class OffsetSeqLog(sparkSession: SparkSession, path: String)
 }
 
 object OffsetSeqLog {
-  private val VERSION = "v1"
+  private[streaming] val VERSION = 1
   private val SERIALIZED_VOID_OFFSET = "-"
 }

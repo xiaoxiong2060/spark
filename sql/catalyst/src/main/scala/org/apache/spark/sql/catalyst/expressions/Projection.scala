@@ -101,6 +101,8 @@ case class InterpretedMutableProjection(expressions: Seq[Expression]) extends Mu
 
 /**
  * A projection that returns UnsafeRow.
+ *
+ * CAUTION: the returned projection object should *not* be assumed to be thread-safe.
  */
 abstract class UnsafeProjection extends Projection {
   override def apply(row: InternalRow): UnsafeRow
@@ -110,14 +112,18 @@ object UnsafeProjection {
 
   /**
    * Returns an UnsafeProjection for given StructType.
+   *
+   * CAUTION: the returned projection object is *not* thread-safe.
    */
   def create(schema: StructType): UnsafeProjection = create(schema.fields.map(_.dataType))
 
   /**
    * Returns an UnsafeProjection for given Array of DataTypes.
+   *
+   * CAUTION: the returned projection object is *not* thread-safe.
    */
   def create(fields: Array[DataType]): UnsafeProjection = {
-    create(fields.zipWithIndex.map(x => new BoundReference(x._2, x._1, true)))
+    create(fields.zipWithIndex.map(x => BoundReference(x._2, x._1, true)))
   }
 
   /**
